@@ -208,7 +208,7 @@ def learn(env_id: str = "Breakout-v4"):
     UPDATE_RATE = 0.8
     ACTION_DIM = env.action_space.n  # type: ignore
     BUFFER_MINLEN = 10000
-    BUFFER_MAXLEN = 100000
+    BUFFER_MAXLEN = 40000
     BATCH_SIZE = 32
     GAMMA = 0.99
     EPSILON_INIT = 1.0
@@ -225,8 +225,8 @@ def learn(env_id: str = "Breakout-v4"):
     # setup replaybuffer and DQN agent
     buffer = ReplayBuffer(BUFFER_MAXLEN)
     agent = None
-    if os.path.exists("./checkpoint.pt"):
-        agent = torch.load("./checkpoint.pt")
+    if os.path.exists("./DQN-agent.pt"):
+        agent = torch.load("./DQN-agent.pt")
     else:
         agent = DQN(
             action_dim=ACTION_DIM,
@@ -375,8 +375,8 @@ if __name__ == "__main__":
         if os.path.exists("./models"):
             shutil.rmtree("./models")
         os.mkdir("./models")
-        if os.path.exists("./checkpoint.pt"):
-            os.remove("./checkpoint.pt")
+        if os.path.exists("./DQN-agent.pt"):
+            os.remove("./DQN-agent.pt")
     if not args.play:
         learn(args.id if args.id is not None else "Breakout-v4")
     else:
