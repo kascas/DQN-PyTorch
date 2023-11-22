@@ -94,12 +94,13 @@ class DQN:
             lr,
         )
         # q_net and q_target_net
-        self.value_net = Net(self.action_dim, in_channel).to(DEVICE)
-        self.target_net = Net(self.action_dim, in_channel).to(DEVICE)
-        self.value_net.train()
-        self.target_net.eval()
-        self.optim = torch.optim.Adam(self.value_net.parameters(), lr=lr)
-        self.count = 0
+        self.q_net = Net(self.action_dim, in_channel).to(DEVICE)
+        self.q_target_net = Net(self.action_dim, in_channel).to(DEVICE)
+        self.optim = torch.optim.Adam(self.q_net.parameters(), lr=lr)
+        self.episode_num, self.step_num = 0, 0
+        self.return_list = []
+        self.q_net.train()
+        self.q_target_net.eval()
         signal.signal(signal.SIGINT, self.signal_handler)
 
     def get_epsilon(self):
@@ -111,28 +112,35 @@ class DQN:
     def get_lr(self):
         return self.lr
 
-    def get_count(self):
-        return self.count
+    def get_episode_num(self):
+        return self.episode_num
+
+    def get_step_num(self):
+        return self.step_num
+
+    def return_list_append(self, mean_return):
+        self.return_list.append(mean_return)
 
     def select_action(self, obs: np.ndarray) -> int:
+        self.step_num += 1
         # add a dim to obs
         x = torch.tensor(obs, dtype=torch.float).unsqueeze(0).to(DEVICE)
         # ε-greedy policy
         if random.random() < self.get_epsilon():
             return random.randint(0, self.action_dim - 1)
         else:
-            # get Q from target_net
+            # get Q from value_net
             with torch.no_grad():
-                self.value_net.eval()
-                values = self.value_net(x)
+                self.q_net.eval()
+                values = self.q_net(x)
             return int(torch.argmax(values).item())
 
     def select_best_action(self, obs: np.ndarray) -> int:
         x = torch.tensor(obs, dtype=torch.float).unsqueeze(0).to(DEVICE)
         # select action without ε-greedy policy
         with torch.no_grad():
-            self.value_net.eval()
-            values = self.value_net(x)
+            self.q_net.eval()
+            values = self.q_net(x)
         return int(torch.argmax(values).item())
 
     def update(self, samples: Tuple[np.ndarray, int, float, np.ndarray, bool]) -> float:
@@ -144,31 +152,31 @@ class DQN:
         next_obs = torch.tensor(next_obs, dtype=torch.float).to(DEVICE)
         done = torch.tensor(done, dtype=torch.float).reshape(-1, 1).to(DEVICE)
 
-        # get qsa from q_net
-        self.value_net.train()
-        qsa = self.value_net(obs).gather(1, action)
-        # get qsa_m from q_target_net
-        qsa_m = reward + self.gamma * self.target_net(next_obs).max(1)[0].view(
+        # get q from q_net
+        self.q_net.train()
+        q = self.q_net(obs).gather(1, action)
+        # get q_target from q_target_net
+        q_target = reward + self.gamma * self.q_target_net(next_obs).max(1)[0].view(
             -1, 1
         ) * (1 - done)
-        # compute loss according to qsa and qsa_m
-        loss = F.mse_loss(qsa, qsa_m)
+        # compute loss according to q and q_target
+        loss = F.mse_loss(q, q_target)
         # use gradient descent to optimize nn
         self.optim.zero_grad()
         loss.backward()
         self.optim.step()
         # synchronize q_target_net with q_net
-        if self.count % self.update_period == 0:
+        if self.episode_num % self.update_period == 0:
             # self.target_net.load_state_dict(self.value_net.state_dict())
             for param1, param2 in zip(
-                self.value_net.parameters(), self.target_net.parameters()
+                self.q_net.parameters(), self.q_target_net.parameters()
             ):
                 new_param_data = (
                     self.update_rate * param1.data
                     + (1 - self.update_rate) * param2.data
                 )
                 param2.data.copy_(new_param_data)
-        self.count += 1
+        self.episode_num += 1
         # reduce the epsilon
         self.epsilon = max(self.epsilon_limit, self.epsilon - self.epsilon_decay)
         return loss.item()
@@ -216,17 +224,16 @@ def learn(env_id: str = "Breakout-v4"):
     EPSILON_LIMIT = 0.1
     STORE_INTERVAL = 1000
 
-    # record every return during training
-    return_list = []
-    total_return = 0
+    # compute mean return
+    mean_return = 0
     # use a deque to store frame history
     frame_history = collections.deque(maxlen=HISTORY_LEN)
 
     # setup replaybuffer and DQN agent
     buffer = ReplayBuffer(BUFFER_MAXLEN)
     agent = None
-    if os.path.exists("./DQN-agent.pt"):
-        agent = torch.load("./DQN-agent.pt")
+    if os.path.exists("checkpoint.pt"):
+        agent = torch.load("checkpoint.pt")
     else:
         agent = DQN(
             action_dim=ACTION_DIM,
@@ -241,17 +248,14 @@ def learn(env_id: str = "Breakout-v4"):
         )
 
     # start training
-    episode_id = agent.get_count()
-    step_num = 0
     for _ in range(EPISODES_NUM):
         # reset
-        final_return = 0
+        episode_return = 0
         frame_history.clear()
         obs, _ = env.reset()
         obs = img_preprocess(obs)
         frame_history.append(obs)
         while True:
-            step_num += 1
             # select an action
             obs_multi = [np.zeros(obs.shape)] * (
                 HISTORY_LEN - len(frame_history)
@@ -269,33 +273,31 @@ def learn(env_id: str = "Breakout-v4"):
                 np.array(next_obs_multi),
                 done,
             )
-            # update the obs and final_return
+            # update the frame_history and episode_return
             frame_history.append(next_obs)
-            final_return += reward
+            episode_return += reward
             # judge if the game is over
             if bool(done):
                 break
-        return_list.append(final_return)
-        total_return += final_return
-        total_loss = 0
+        mean_return += episode_return / UPDATE_PERIOD
+        loss = 0
         # train the q_net and q_target_net
         if buffer.size() >= BUFFER_MINLEN:
             samples = buffer.sample(BATCH_SIZE)
             loss = agent.update(samples)
-            total_loss += loss
-            episode_id += 1
         # print training info on the screen
         terminal_width = os.get_terminal_size().columns
+        episode_id = agent.get_episode_num()
         print(
             " " * (terminal_width - 1)
             + "\r {:<4d}: epsilon={:.3f}, step={}, lr={:.2e}, buffer_size={:<5d}, return={:.2f}, loss={:.2e}".format(
-                episode_id,
+                agent.get_episode_num(),
                 agent.get_epsilon(),
-                step_num,
+                agent.get_step_num(),
                 agent.get_lr(),
                 buffer.size(),
-                final_return,
-                total_loss,
+                episode_return,
+                loss,
             )[
                 : terminal_width - 1
             ],
@@ -307,14 +309,14 @@ def learn(env_id: str = "Breakout-v4"):
                 + "\r{}-{} episodes' mean return: {:.3f}".format(
                     episode_id - UPDATE_PERIOD,
                     episode_id,
-                    total_return / UPDATE_PERIOD,
+                    mean_return,
                 )
             )
-            total_return = 0
+            agent.return_list_append(mean_return)
+            mean_return = 0
         if episode_id % STORE_INTERVAL == 0 and episode_id != 0:
-            torch.save(agent, f"./models/DQN-{episode_id}.pt")
-    torch.save(agent, "./DQN-agent.pt")
-    torch.save(return_list, "./return_list.pt")
+            torch.save(agent, f"./models/DQN-{env_id}-{episode_id}.pt")
+    torch.save(agent, f"./DQN-{env_id}.pt")
 
 
 def play(filepath, env_id: str = "Breakout-v4", render_mode: str = "rgb_array"):
@@ -335,25 +337,22 @@ def play(filepath, env_id: str = "Breakout-v4", render_mode: str = "rgb_array"):
         obs = img_preprocess(obs)
         frame_history.clear()
         frame_history.append(obs)
-        step_num = 0
-        final_return = 0
+        episode_return = 0
         while True:
-            step_num += 1
             # select an action
             obs_multi = [np.zeros(obs.shape)] * (
                 HISTORY_LEN - len(frame_history)
             ) + list(frame_history)
-
             action = agent.select_action(np.array(obs_multi))
             # perform an action and get feedback
             next_obs, reward, done, _, _ = env.step(action)
             next_obs = img_preprocess(next_obs)
-            final_return += reward
+            episode_return += reward
             # update the obs and final_return
             frame_history.append(next_obs)
             if bool(done):
                 break
-        print(f"return {final_return}")
+        print(f"return {episode_return}")
 
 
 if __name__ == "__main__":
@@ -371,17 +370,18 @@ if __name__ == "__main__":
     parser.add_argument("-m", "--mode", help="select render mode")
 
     args = parser.parse_args()
+    env_id = args.id if args.id is not None else "Breakout-v4"
     if args.delete:
         if os.path.exists("./models"):
             shutil.rmtree("./models")
         os.mkdir("./models")
-        if os.path.exists("./DQN-agent.pt"):
-            os.remove("./DQN-agent.pt")
+        if os.path.exists("checkpoint.pt"):
+            os.remove("checkpoint.pt")
     if not args.play:
-        learn(args.id if args.id is not None else "Breakout-v4")
+        learn(env_id)
     else:
         play(
             args.play,
-            args.id if args.id is not None else "Breakout-v4",
+            env_id,
             args.mode if args.mode is not None else "rgb_array",
         )
