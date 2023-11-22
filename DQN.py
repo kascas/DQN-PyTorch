@@ -220,7 +220,7 @@ FRAME_SKIP = 4
 HISTORY_LEN = 4
 
 
-def learn(env_id: str = "Breakout-v4"):
+def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
     # setup game environment
     env = gym.make(
         env_id,
@@ -267,6 +267,9 @@ def learn(env_id: str = "Breakout-v4"):
             epsilon_limit=EPSILON_LIMIT,
             lr=LR,
         )
+    if epsilon != -1:
+        assert 0 <= epsilon <= 1
+        agent.set_epsilon(epsilon)
     signal.signal(signal.SIGINT, signal_handler(agent))
     # start training
     for _ in range(EPISODES_NUM):
@@ -391,9 +394,11 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--delete", help="delete tmp files", action="store_true")
     parser.add_argument("-i", "--id", help="select atari env")
     parser.add_argument("-m", "--mode", help="select render mode")
+    parser.add_argument("-e", "--epsilon", help="set epsilon for training")
 
     args = parser.parse_args()
     env_id = args.id if args.id is not None else "Breakout-v4"
+    epsilon = float(args.epsilon) if args.epsilon is not None else -1
     if args.delete:
         if os.path.exists("./models"):
             shutil.rmtree("./models")
@@ -401,7 +406,7 @@ if __name__ == "__main__":
         if os.path.exists("checkpoint.pt"):
             os.remove("checkpoint.pt")
     if not args.play:
-        learn(env_id)
+        learn(env_id, epsilon)
     else:
         play(
             args.play,
