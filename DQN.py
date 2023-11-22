@@ -195,6 +195,7 @@ def plot_return_curve(return_list: list, step: int, xticks_interval: int = 5000)
     xdata, ydata = [i * step for i in range(len(return_list))], return_list
     plt.plot(xdata, ydata)
     plt.savefig("return_curve.svg")
+    plt.close()
 
 
 def img_preprocess(x: np.ndarray) -> np.ndarray:
