@@ -9,6 +9,7 @@ import numpy as np
 from typing import Tuple
 import signal
 import cv2
+import matplotlib.pyplot as plt
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -65,7 +66,7 @@ class DQN:
     def __init__(
         self,
         action_dim: int,
-        update_period: int = 1000,
+        update_freq: int = 1000,
         update_rate: float = 0.5,
         gamma: float = 0.99,
         lr: float = 1e-5,
@@ -80,7 +81,7 @@ class DQN:
             self.epsilon,
             self.epsilon_limit,
             self.epsilon_decay,
-            self.update_period,
+            self.update_freq,
             self.update_rate,
             self.lr,
         ) = (
@@ -89,7 +90,7 @@ class DQN:
             epsilon_init,
             epsilon_limit,
             epsilon_decay,
-            update_period,
+            update_freq,
             update_rate,
             lr,
         )
@@ -101,7 +102,6 @@ class DQN:
         self.return_list = []
         self.q_net.train()
         self.q_target_net.eval()
-        signal.signal(signal.SIGINT, self.signal_handler)
 
     def get_epsilon(self):
         return self.epsilon
@@ -120,6 +120,12 @@ class DQN:
 
     def return_list_append(self, mean_return):
         self.return_list.append(mean_return)
+
+    def get_return_list(self):
+        return self.return_list
+
+    def get_update_freq(self):
+        return self.update_freq
 
     def select_action(self, obs: np.ndarray) -> int:
         self.step_num += 1
@@ -166,7 +172,7 @@ class DQN:
         loss.backward()
         self.optim.step()
         # synchronize q_target_net with q_net
-        if self.episode_num % self.update_period == 0:
+        if self.episode_num % self.update_freq == 0:
             # self.target_net.load_state_dict(self.value_net.state_dict())
             for param1, param2 in zip(
                 self.q_net.parameters(), self.q_target_net.parameters()
@@ -181,18 +187,32 @@ class DQN:
         self.epsilon = max(self.epsilon_limit, self.epsilon - self.epsilon_decay)
         return loss.item()
 
-    def signal_handler(self, signal, frame):
-        print(
-            "\n=== PROGRAM IS TERMINATED, CHECKPOINT IS SAVED AS `./checkpoint.pt` ==="
-        )
-        torch.save(self, "checkpoint.pt")
-        exit(0)
+
+def plot_return_curve(return_list: list, step: int, xticks_interval: int = 5000):
+    plt.figure()
+    plt.xlabel("The Number of Episodes")
+    plt.ylabel(f"Last {step} Episodes' Mean Return")
+    xdata, ydata = [i * step for i in range(len(return_list))], return_list
+    plt.plot(xdata, ydata)
+    plt.savefig("return_curve.svg")
 
 
 def img_preprocess(x: np.ndarray) -> np.ndarray:
     x = cv2.cvtColor(cv2.resize(x, (84, 84)), cv2.COLOR_RGB2GRAY)
     _, x = cv2.threshold(x, 1, 255, cv2.THRESH_BINARY)
     return x.astype(np.float64)
+
+
+def signal_handler(agent: DQN):
+    def handler(signum, frame):
+        print(
+            "\n=== PROGRAM IS TERMINATED, CHECKPOINT IS SAVED AS `./checkpoint.pt` ==="
+        )
+        plot_return_curve(agent.get_return_list(), agent.get_update_freq())
+        torch.save(agent, "checkpoint.pt")
+        exit(0)
+
+    return handler
 
 
 FRAME_SKIP = 4
@@ -212,7 +232,7 @@ def learn(env_id: str = "Breakout-v4"):
     # setup parameteres
     EPISODES_NUM = 100000
     LR = 1e-6
-    UPDATE_PERIOD = 200
+    UPDATE_FREQ = 200
     UPDATE_RATE = 0.8
     ACTION_DIM = env.action_space.n  # type: ignore
     BUFFER_MINLEN = 10000
@@ -238,7 +258,7 @@ def learn(env_id: str = "Breakout-v4"):
         agent = DQN(
             action_dim=ACTION_DIM,
             in_channel=HISTORY_LEN,
-            update_period=UPDATE_PERIOD,
+            update_freq=UPDATE_FREQ,
             update_rate=UPDATE_RATE,
             gamma=GAMMA,
             epsilon_init=EPSILON_INIT,
@@ -246,6 +266,8 @@ def learn(env_id: str = "Breakout-v4"):
             epsilon_limit=EPSILON_LIMIT,
             lr=LR,
         )
+
+    signal.signal(signal.SIGINT, signal_handler(agent))
 
     # start training
     for _ in range(EPISODES_NUM):
@@ -279,7 +301,7 @@ def learn(env_id: str = "Breakout-v4"):
             # judge if the game is over
             if bool(done):
                 break
-        mean_return += episode_return / UPDATE_PERIOD
+        mean_return += episode_return / UPDATE_FREQ
         loss = 0
         # train the q_net and q_target_net
         if buffer.size() >= BUFFER_MINLEN:
@@ -303,20 +325,22 @@ def learn(env_id: str = "Breakout-v4"):
             ],
             end="\r",
         )
-        if episode_id % UPDATE_PERIOD == 0 and episode_id != 0:
+        if episode_id % UPDATE_FREQ == 0 and episode_id != 0:
+            agent.return_list_append(mean_return)
+            plot_return_curve(agent.get_return_list(), UPDATE_FREQ)
             print(
                 " " * (terminal_width - 1)
                 + "\r{}-{} episodes' mean return: {:.3f}".format(
-                    episode_id - UPDATE_PERIOD,
+                    episode_id - UPDATE_FREQ,
                     episode_id,
                     mean_return,
                 )
             )
-            agent.return_list_append(mean_return)
             mean_return = 0
         if episode_id % STORE_INTERVAL == 0 and episode_id != 0:
             torch.save(agent, f"./models/DQN-{env_id}-{episode_id}.pt")
     torch.save(agent, f"./DQN-{env_id}.pt")
+    plot_return_curve(agent.get_return_list(), UPDATE_FREQ)
 
 
 def play(filepath, env_id: str = "Breakout-v4", render_mode: str = "rgb_array"):

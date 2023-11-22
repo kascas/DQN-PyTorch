@@ -1,3 +1,5 @@
 *.pt
 models
 .vscode
+*.svg
+*.png
