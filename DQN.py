@@ -6,7 +6,7 @@ import random
 import os
 import collections
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Union
 import signal
 import cv2
 import matplotlib.pyplot as plt
@@ -203,13 +203,14 @@ def img_preprocess(x: np.ndarray) -> np.ndarray:
     return x.astype(np.float64)
 
 
-def signal_handler(agent: DQN):
+def signal_handler(agent: Union[DQN, None]):
     def handler(signum, frame):
-        print(
-            "\n=== PROGRAM IS TERMINATED, CHECKPOINT IS SAVED AS `./checkpoint.pt` ==="
-        )
-        plot_return_curve(agent.get_return_list(), agent.get_update_freq())
-        torch.save(agent, "checkpoint.pt")
+        if agent != None:
+            print(
+                "\n=== PROGRAM IS TERMINATED, CHECKPOINT IS SAVED AS `./checkpoint.pt` ==="
+            )
+            plot_return_curve(agent.get_return_list(), agent.get_update_freq())
+            torch.save(agent, "checkpoint.pt")
         exit(0)
 
     return handler
@@ -266,9 +267,7 @@ def learn(env_id: str = "Breakout-v4"):
             epsilon_limit=EPSILON_LIMIT,
             lr=LR,
         )
-
     signal.signal(signal.SIGINT, signal_handler(agent))
-
     # start training
     for _ in range(EPISODES_NUM):
         # reset
