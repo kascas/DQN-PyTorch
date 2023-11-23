@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import gym
+import gymnasium as gym
 import random
 import os
 import collections
@@ -10,6 +10,7 @@ from typing import Tuple, Union
 import signal
 import cv2
 import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -18,28 +19,43 @@ class ReplayBuffer:
     def __init__(self, maxlen: int = 10000) -> None:
         # max length of buffer
         self.maxlen = maxlen
-        self.buffer = collections.deque(maxlen=maxlen)
+        self.obs_buffer = list()
+        # reward, action, done buffer
+        self.rad_buffer = list()
 
     def add(
         self,
         obs: np.ndarray,
         action: int,
         reward: float,
-        next_obs: np.ndarray,
         done: bool,
     ) -> None:
-        self.buffer.append((obs, action, reward, next_obs, done))
+        if len(self.obs_buffer) >= self.maxlen:
+            self.obs_buffer.pop(0)
+            self.rad_buffer.pop(0)
+        self.obs_buffer.append(obs)
+        self.rad_buffer.append((reward, action, done))
 
     def sample(
-        self, batch_size: int = 64
+        self, batch_size: int = 64, history_len: int = 4
     ) -> Tuple[np.ndarray, int, float, np.ndarray, bool]:
-        obs, action, reward, next_obs, done = zip(
-            *random.sample(self.buffer, batch_size)
-        )
+        rand_list, sample_list = [], []
+        while True:
+            ind = random.randint(0 + history_len - 1, len(self.obs_buffer) - 1 - 1)
+            if ind in rand_list or self.rad_buffer[ind][1] == -1:
+                continue
+            rand_list.append(ind)
+            obs = self.obs_buffer[ind - history_len + 1 : ind + 1]
+            next_obs = self.obs_buffer[ind - history_len + 2 : ind + 2]
+            reward, action, done = self.rad_buffer[ind]
+            sample_list.append([obs, action, reward, next_obs, done])
+            if len(rand_list) == batch_size:
+                break
+        obs, action, reward, next_obs, done = zip(*sample_list)
         return (np.array(obs), action, reward, np.array(next_obs), done)
 
     def size(self) -> int:
-        return len(self.buffer)
+        return len(self.obs_buffer)
 
 
 class Net(nn.Module):
@@ -80,6 +96,7 @@ class DQN:
             self.action_dim,
             self.gamma,
             self.epsilon,
+            self.epsilon_init,
             self.epsilon_limit,
             self.epsilon_decay,
             self.update_freq,
@@ -89,6 +106,7 @@ class DQN:
         ) = (
             action_dim,
             gamma,
+            epsilon_init,
             epsilon_init,
             epsilon_limit,
             epsilon_decay,
@@ -101,8 +119,9 @@ class DQN:
         self.q_net = Net(self.action_dim, in_channel).to(DEVICE)
         self.q_target_net = Net(self.action_dim, in_channel).to(DEVICE)
         self.optim = torch.optim.Adam(self.q_net.parameters(), lr=lr)
+        self.scheduler = CosineAnnealingWarmRestarts(self.optim, T_0=10000, T_mult=2)
         self.episode_num, self.step_num = 0, 0
-        self.return_list = []
+        self.return_list, self.lr_list = [], []
         self.q_net.train()
         self.q_target_net.eval()
 
@@ -150,8 +169,9 @@ class DQN:
         self.optim.zero_grad()
         loss.backward()
         self.optim.step()
+        # self.scheduler.step()
         # synchronize q_target_net with q_net
-        if self.episode_num % self.update_freq == 0:
+        if self.step_num % self.update_freq == 0:
             # self.target_net.load_state_dict(self.value_net.state_dict())
             for param1, param2 in zip(
                 self.q_net.parameters(), self.q_target_net.parameters()
@@ -161,19 +181,31 @@ class DQN:
                     + (1 - self.update_rate) * param2.data
                 )
                 param2.data.copy_(new_param_data)
-        self.episode_num += 1
         # reduce the epsilon
-        self.epsilon = max(self.epsilon_limit, self.epsilon - self.epsilon_decay)
+        self.epsilon = max(
+            self.epsilon_limit,
+            self.epsilon_init
+            - (self.epsilon_init - self.epsilon_limit)
+            / self.epsilon_decay
+            * self.step_num,
+        )
         return loss.item()
 
 
-def plot_return_curve(return_list: list, step: int):
-    plt.figure()
+def plot_return_curve(return_list: list, lr_list: list, step: int):
+    plt.figure(figsize=(10, 10))
+    # plt.subplot(2, 1, 1)
     plt.xlabel("The Number of Episodes")
     plt.ylabel(f"Last {step} Episodes' Mean Return")
     xdata, ydata = [i * step for i in range(len(return_list))], return_list
     plt.plot(xdata, ydata)
-    plt.savefig("return_curve.svg")
+    # plt.subplot(2, 1, 2)
+    # plt.xlabel("The Number of Episodes")
+    # plt.ylabel(f"Learning Rate")
+    # plt.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    # xdata, ydata = [i * step for i in range(len(lr_list))], lr_list
+    # plt.plot(xdata, ydata)
+    plt.savefig("return_lr_curve.svg")
     plt.close()
 
 
@@ -186,10 +218,8 @@ def img_preprocess(x: np.ndarray) -> np.ndarray:
 def signal_handler(agent: Union[DQN, None]):
     def handler(signum, frame):
         if agent != None:
-            print(
-                "\n=== PROGRAM IS TERMINATED, CHECKPOINT IS SAVED AS `./checkpoint.pt` ==="
-            )
-            plot_return_curve(agent.return_list, agent.log_freq)
+            print("\n\nPROGRAM IS TERMINATED, CHECKPOINT IS SAVED AS `./checkpoint.pt`")
+            plot_return_curve(agent.return_list, agent.lr_list, agent.log_freq)
             torch.save(agent, "checkpoint.pt")
         exit(0)
 
@@ -211,20 +241,27 @@ def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
     env.reset()
 
     # setup parameteres
-    EPISODES_NUM = 100000
-    LR = 1e-6
-    UPDATE_FREQ = 10
-    UPDATE_RATE = 0.8
+    EPISODES_NUM = 1_00000
+    LR = 1e-4
+    # update q_target_net to q_net every UPDATE_FREQ steps
+    UPDATE_FREQ = 1_0000
+    # q_target_net = UPDATE_RATE * q_net + (1 - UPDATE_RATE) * q_target_net
+    UPDATE_RATE = 1
+    # do agent.update every TRAIN_FREQ steps
+    TRAIN_FREQ = 10
     ACTION_DIM = env.action_space.n  # type: ignore
-    BUFFER_MINLEN = 10000
-    BUFFER_MAXLEN = 40000
+    BUFFER_MINLEN = 1_0000
+    BUFFER_MAXLEN = 2_00000
     BATCH_SIZE = 32
     GAMMA = 0.99
     EPSILON_INIT = 1.0
-    EPSILON_DECAY = 1e-4
+    # when the num of steps comes to EPSILON_DECAY, agent.epsilon
+    EPSILON_DECAY = 1_00_000
     EPSILON_LIMIT = 0.1
-    STORE_INTERVAL = 1000
-    LOG_FREQ = 100
+    # save model every STORE_INTERVAL steps
+    STORE_INTERVAL = 1_000
+    # record training info every LOG_FREQ episodes
+    LOG_FREQ = 1_00
 
     # compute mean return
     mean_return = 0
@@ -251,7 +288,7 @@ def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
         )
     if epsilon != -1:
         assert 0 <= epsilon <= 1
-        agent.epsilon=epsilon
+        agent.epsilon = epsilon
     signal.signal(signal.SIGINT, signal_handler(agent))
     # start training
     for _ in range(EPISODES_NUM):
@@ -261,36 +298,38 @@ def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
         obs, _ = env.reset()
         obs = img_preprocess(obs)
         frame_history.append(obs)
+        total_loss, count = 0, 0
         while True:
-            # select an action
+            # combine a set of obs to obs_multi
             obs_multi = [np.zeros(obs.shape)] * (
                 HISTORY_LEN - len(frame_history)
             ) + list(frame_history)
+            # select an action
             action = agent.select_action(np.array(obs_multi))
             # perform an action and get feedback
             next_obs, reward, done, _, _ = env.step(action)
             next_obs = img_preprocess(next_obs)
             # update the replaybuffer
-            next_obs_multi = obs_multi[1:] + [next_obs]
-            buffer.add(
-                np.array(obs_multi),
-                action,
-                reward,
-                np.array(next_obs_multi),
-                done,
-            )
+            buffer.add(obs, action, float(reward), done)
             # update the frame_history and episode_return
             frame_history.append(next_obs)
-            episode_return += reward
+            episode_return += float(reward)
+            obs = next_obs
+            # train the q_net and q_target_net
+            if buffer.size() >= BUFFER_MINLEN:
+                count += 1
+                if count % TRAIN_FREQ == 0:
+                    samples = buffer.sample(BATCH_SIZE, HISTORY_LEN)
+                    loss = agent.update(samples)
+                    total_loss += loss
             # judge if the game is over
             if bool(done):
+                # add the final obs
+                buffer.add(next_obs, -1, -1, True)
                 break
-        mean_return += episode_return / LOG_FREQ
-        loss = 0
-        # train the q_net and q_target_net
         if buffer.size() >= BUFFER_MINLEN:
-            samples = buffer.sample(BATCH_SIZE)
-            loss = agent.update(samples)
+            agent.episode_num += 1
+            mean_return += episode_return / LOG_FREQ
         # print training info on the screen
         terminal_width = os.get_terminal_size().columns
         episode_id = agent.episode_num
@@ -300,10 +339,10 @@ def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
                 agent.episode_num,
                 agent.epsilon,
                 agent.step_num,
-                agent.lr,
+                agent.scheduler.get_last_lr()[0],
                 buffer.size(),
                 episode_return,
-                loss,
+                total_loss / (count / TRAIN_FREQ) if count != 0 else 0,
             )[
                 : terminal_width - 1
             ],
@@ -311,20 +350,13 @@ def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
         )
         if episode_id % LOG_FREQ == 0 and episode_id != 0:
             agent.return_list.append(mean_return)
-            plot_return_curve(agent.return_list, LOG_FREQ)
-            # print(
-            #     " " * (terminal_width - 1)
-            #     + "\r{}-{} episodes' mean return: {:.3f}".format(
-            #         episode_id - UPDATE_FREQ,
-            #         episode_id,
-            #         mean_return,
-            #     )
-            # )
+            agent.lr_list.append(agent.scheduler.get_last_lr()[0])
+            plot_return_curve(agent.return_list, agent.lr_list, LOG_FREQ)
             mean_return = 0
         if episode_id % STORE_INTERVAL == 0 and episode_id != 0:
             torch.save(agent, f"./models/DQN-{env_id}-{episode_id}.pt")
     torch.save(agent, f"./DQN-{env_id}.pt")
-    plot_return_curve(agent.return_list, LOG_FREQ)
+    plot_return_curve(agent.return_list, agent.lr_list, LOG_FREQ)
 
 
 def play(filepath, env_id: str = "Breakout-v4", render_mode: str = "rgb_array"):
@@ -355,7 +387,7 @@ def play(filepath, env_id: str = "Breakout-v4", render_mode: str = "rgb_array"):
             # perform an action and get feedback
             next_obs, reward, done, _, _ = env.step(action)
             next_obs = img_preprocess(next_obs)
-            episode_return += reward
+            episode_return += float(reward)
             # update the obs and final_return
             frame_history.append(next_obs)
             if bool(done):
