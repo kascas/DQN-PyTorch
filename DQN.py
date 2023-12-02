@@ -142,10 +142,15 @@ class DQN:
     def select_best_action(self, obs: np.ndarray) -> int:
         x = torch.tensor(obs, dtype=torch.float).unsqueeze(0).to(DEVICE)
         # select action without ε-greedy policy
-        with torch.no_grad():
-            self.q_net.eval()
-            values = self.q_net(x)
-        return int(torch.argmax(values).item())
+        # ε-greedy policy
+        if random.random() < 0.02:
+            return random.randint(0, self.action_dim - 1)
+        else:
+            # get Q from value_net
+            with torch.no_grad():
+                self.q_net.eval()
+                values = self.q_net(x)
+            return int(torch.argmax(values).item())
 
     def update(self, samples: Tuple[np.ndarray, int, float, np.ndarray, bool]) -> float:
         # unpack samples
@@ -230,7 +235,9 @@ FRAME_SKIP = 4
 HISTORY_LEN = 4
 
 
-def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
+def learn(
+    env_id: str = "Breakout-v4", epsilon: float = -1, lr: float = -1, save: bool = False
+):
     # setup game environment
     env = gym.make(
         env_id,
@@ -265,6 +272,8 @@ def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
 
     # compute mean return
     mean_return = 0
+    max_return = -1e6
+    max_mean_return = -1e6
     # use a deque to store frame history
     frame_history = collections.deque(maxlen=HISTORY_LEN)
 
@@ -289,6 +298,9 @@ def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
     if epsilon != -1:
         assert 0 <= epsilon <= 1
         agent.epsilon = epsilon
+    if lr != -1:
+        assert lr > 0
+        agent.lr = lr
     signal.signal(signal.SIGINT, signal_handler(agent))
     # start training
     for _ in range(EPISODES_NUM):
@@ -330,6 +342,9 @@ def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
         if buffer.size() >= BUFFER_MINLEN:
             agent.episode_num += 1
             mean_return += episode_return / LOG_FREQ
+        # if save and episode_return > max_return:
+        #     max_return = episode_return
+        #     torch.save(agent, f"./DQN-MAX-[{episode_return}].pt")
         # print training info on the screen
         terminal_width = os.get_terminal_size().columns
         episode_id = agent.episode_num
@@ -352,6 +367,9 @@ def learn(env_id: str = "Breakout-v4", epsilon: float = -1):
             agent.return_list.append(mean_return)
             agent.lr_list.append(agent.scheduler.get_last_lr()[0])
             plot_return_curve(agent.return_list, agent.lr_list, LOG_FREQ)
+            if save and mean_return > max_mean_return:
+                max_mean_return = mean_return
+                torch.save(agent, f"./DQN-MAX_MEAN_RETURN.pt")
             mean_return = 0
         if episode_id % STORE_INTERVAL == 0 and episode_id != 0:
             torch.save(agent, f"./models/DQN-{env_id}-{episode_id}.pt")
@@ -383,7 +401,7 @@ def play(filepath, env_id: str = "Breakout-v4", render_mode: str = "rgb_array"):
             obs_multi = [np.zeros(obs.shape)] * (
                 HISTORY_LEN - len(frame_history)
             ) + list(frame_history)
-            action = agent.select_action(np.array(obs_multi))
+            action = agent.select_best_action(np.array(obs_multi))
             # perform an action and get feedback
             next_obs, reward, done, _, _ = env.step(action)
             next_obs = img_preprocess(next_obs)
@@ -409,10 +427,19 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--id", help="select atari env")
     parser.add_argument("-m", "--mode", help="select render mode")
     parser.add_argument("-e", "--epsilon", help="set epsilon for training")
+    parser.add_argument("--lr", help="set learning rate for training")
+    parser.add_argument(
+        "-s",
+        "--save",
+        help="save the model which has the best performance",
+        action="store_true",
+    )
 
     args = parser.parse_args()
     env_id = args.id if args.id is not None else "Breakout-v4"
     epsilon = float(args.epsilon) if args.epsilon is not None else -1
+    lr = float(args.lr) if args.lr is not None else -1
+    filepath = args.play if args.play is not None else "checkpoint.pt"
     if args.delete:
         if os.path.exists("./models"):
             shutil.rmtree("./models")
@@ -420,10 +447,10 @@ if __name__ == "__main__":
         if os.path.exists("checkpoint.pt"):
             os.remove("checkpoint.pt")
     if not args.play:
-        learn(env_id, epsilon)
+        learn(env_id, epsilon, lr, args.save)
     else:
         play(
-            args.play,
+            filepath,
             env_id,
             args.mode if args.mode is not None else "rgb_array",
         )
